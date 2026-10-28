@@ -19,13 +19,11 @@
 #
 #
 import logging
-import re
 from typing import (
     TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
-    TypedDict,
 )
 
 from synapse.api.constants import ApprovalNoticeMedium
@@ -35,21 +33,13 @@ from synapse.api.errors import (
     LoginError,
     NotApprovedError,
     SynapseError,
-    UserDeactivatedError,
-    UserLockedError,
 )
 from synapse.api.ratelimiting import Ratelimiter
-from synapse.api.urls import CLIENT_API_PREFIX
 from synapse.appservice import ApplicationService
-from synapse.handlers.sso import SsoIdentityProvider, SsoSetupError
-from synapse.http import get_request_uri
-from synapse.http.server import HttpServer, finish_request
+from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
-    assert_params_in_dict,
-    parse_bytes_from_args,
     parse_json_object_from_request,
-    parse_string,
 )
 from synapse.http.site import RequestInfo, SynapseRequest
 from synapse.rest.client._base import client_patterns
@@ -59,17 +49,21 @@ from synapse.types import JsonDict, UserID
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
+from synapse.rest.client.login_completion import (
+    LoginResponse,
+    complete_login,
+    jwt_login,
+    token_login,
+)
+from synapse.rest.client.login_refresh import RefreshTokenServlet
+from synapse.rest.client.login_sso import (
+    CasTicketServlet,
+    SsoRedirectServlet,
+    _get_auth_flow_dict_for_idp,
+    _load_sso_handlers,
+)
+
 logger = logging.getLogger(__name__)
-
-
-class LoginResponse(TypedDict, total=False):
-    user_id: str
-    access_token: str | None
-    home_server: str
-    expires_in_ms: int | None
-    refresh_token: str | None
-    device_id: str | None
-    well_known: dict[str, Any] | None
 
 
 class LoginRestServlet(RestServlet):
@@ -379,135 +373,20 @@ class LoginRestServlet(RestServlet):
         *,
         request_info: RequestInfo,
     ) -> LoginResponse:
-        """Called when we've successfully authed the user and now need to
-        actually login them in (e.g. create devices). This gets called on
-        all successful logins.
-
-        Applies the ratelimiting for successful login attempts against an
-        account.
-
-        Args:
-            user_id: ID of the user to register.
-            login_submission: Dictionary of login information.
-            callback: Callback function to run after login.
-            create_non_existent_users: Whether to create the user if they don't
-                exist. Defaults to False.
-            ratelimit: Whether to ratelimit the login request.
-            auth_provider_id: The SSO IdP the user used, if any.
-            should_issue_refresh_token: True if this login should issue
-                a refresh token alongside the access token.
-            auth_provider_session_id: The session ID got during login from the SSO IdP.
-            should_check_deactivated_or_locked: True if the user should be checked for
-                deactivation or locked status before logging in.
-
-                This exists purely for appservice's configured sender_localpart
-                which doesn't have an associated user in the database.
-            request_info: The user agent/IP address of the user.
-
-        Returns:
-            Dictionary of account information after successful login.
-        """
-
-        # Before we actually log them in we check if they've already logged in
-        # too often. This happens here rather than before as we don't
-        # necessarily know the user before now.
-        if ratelimit:
-            await self._account_ratelimiter.ratelimit(None, user_id.lower())
-
-        if create_non_existent_users:
-            canonical_uid = await self.auth_handler.check_user_exists(user_id)
-            if not canonical_uid:
-                canonical_uid = await self.registration_handler.register_user(
-                    localpart=UserID.from_string(user_id).localpart,
-                    default_display_name=default_display_name,
-                )
-            user_id = canonical_uid
-
-        # If the account has been deactivated or locked, do not proceed with the login.
-        if should_check_deactivated_or_locked:
-            deactivated = await self._main_store.get_user_deactivated_status(user_id)
-            if deactivated:
-                raise UserDeactivatedError("This account has been deactivated")
-            locked = await self._main_store.get_user_locked_status(user_id)
-            if locked:
-                raise UserLockedError()
-
-        device_id = login_submission.get("device_id")
-
-        # If device_id is present, check that device_id is not longer than a reasonable 512 characters
-        if device_id and len(device_id) > 512:
-            raise LoginError(
-                400,
-                "device_id cannot be longer than 512 characters.",
-                errcode=Codes.INVALID_PARAM,
-            )
-
-        if self._require_approval:
-            approved = await self.auth_handler.is_user_approved(user_id)
-            if not approved:
-                # If the user isn't approved (and needs to be) we won't allow them to
-                # actually log in, so we don't want to create a device/access token.
-                return LoginResponse(
-                    user_id=user_id,
-                    home_server=self.hs.hostname,
-                )
-
-        initial_display_name = login_submission.get("initial_device_display_name")
-        spam_check = await self._spam_checker.check_login_for_spam(
-            user_id,
-            device_id=device_id,
-            initial_display_name=initial_display_name,
-            request_info=[(request_info.user_agent, request_info.ip)],
-            auth_provider_id=auth_provider_id,
-        )
-        if spam_check != self._spam_checker.NOT_SPAM:
-            logger.info("Blocking login due to spam checker")
-            raise SynapseError(
-                403,
-                msg="Login was blocked by the server",
-                errcode=spam_check[0],
-                additional_fields=spam_check[1],
-            )
-
-        (
-            device_id,
-            access_token,
-            valid_until_ms,
-            refresh_token,
-        ) = await self.registration_handler.register_device(
-            user_id,
-            device_id,
-            initial_display_name,
+        return await complete_login(
+            self,
+            user_id=user_id,
+            login_submission=login_submission,
+            callback=callback,
+            create_non_existent_users=create_non_existent_users,
+            default_display_name=default_display_name,
+            ratelimit=ratelimit,
             auth_provider_id=auth_provider_id,
             should_issue_refresh_token=should_issue_refresh_token,
             auth_provider_session_id=auth_provider_session_id,
+            should_check_deactivated_or_locked=should_check_deactivated_or_locked,
+            request_info=request_info,
         )
-
-        result = LoginResponse(
-            user_id=user_id,
-            access_token=access_token,
-            home_server=self.hs.hostname,
-            device_id=device_id,
-        )
-
-        # execute the callback
-        await self._account_validity_handler.on_user_login(
-            user_id,
-            auth_provider_type=login_submission.get("type"),
-            auth_provider_id=auth_provider_id,
-        )
-
-        if valid_until_ms is not None:
-            expires_in_ms = valid_until_ms - self.clock.time_msec()
-            result["expires_in_ms"] = expires_in_ms
-
-        if refresh_token is not None:
-            result["refresh_token"] = refresh_token
-
-        if callback is not None:
-            await callback(result)
-
-        return result
 
     async def _do_token_login(
         self,
@@ -516,27 +395,10 @@ class LoginRestServlet(RestServlet):
         *,
         request_info: RequestInfo,
     ) -> LoginResponse:
-        """
-        Handle token login.
-
-        Args:
-            login_submission: The JSON request body.
-            should_issue_refresh_token: True if this login should issue
-                a refresh token alongside the access token.
-
-        Returns:
-            The body of the JSON response.
-        """
-        token = login_submission["token"]
-        res = await self.auth_handler.consume_login_token(token)
-
-        return await self._complete_login(
-            res.user_id,
-            login_submission,
-            self.auth_handler._sso_login_callback,
-            auth_provider_id=res.auth_provider_id,
+        return await token_login(
+            self,
+            login_submission=login_submission,
             should_issue_refresh_token=should_issue_refresh_token,
-            auth_provider_session_id=res.auth_provider_session_id,
             request_info=request_info,
         )
 
@@ -547,188 +409,11 @@ class LoginRestServlet(RestServlet):
         *,
         request_info: RequestInfo,
     ) -> LoginResponse:
-        """
-        Handle the custom JWT login.
-
-        Args:
-            login_submission: The JSON request body.
-            should_issue_refresh_token: True if this login should issue
-                a refresh token alongside the access token.
-
-        Returns:
-            The body of the JSON response.
-        """
-        user_id, default_display_name = self.hs.get_jwt_handler().validate_login(
-            login_submission
-        )
-        return await self._complete_login(
-            user_id,
-            login_submission,
-            create_non_existent_users=True,
-            default_display_name=default_display_name,
+        return await jwt_login(
+            self,
+            login_submission=login_submission,
             should_issue_refresh_token=should_issue_refresh_token,
             request_info=request_info,
-        )
-
-
-def _get_auth_flow_dict_for_idp(idp: SsoIdentityProvider) -> JsonDict:
-    """Return an entry for the login flow dict
-
-    Returns an entry suitable for inclusion in "identity_providers" in the
-    response to GET /_matrix/client/r0/login
-
-    Args:
-        idp: the identity provider to describe
-    """
-    e: JsonDict = {"id": idp.idp_id, "name": idp.idp_name}
-    if idp.idp_icon:
-        e["icon"] = idp.idp_icon
-    if idp.idp_brand:
-        e["brand"] = idp.idp_brand
-    return e
-
-
-class RefreshTokenServlet(RestServlet):
-    PATTERNS = client_patterns("/refresh$")
-    CATEGORY = "Registration/login requests"
-
-    def __init__(self, hs: "HomeServer"):
-        self._auth_handler = hs.get_auth_handler()
-        self._clock = hs.get_clock()
-        self.refreshable_access_token_lifetime = (
-            hs.config.registration.refreshable_access_token_lifetime
-        )
-        self.refresh_token_lifetime = hs.config.registration.refresh_token_lifetime
-
-    async def on_POST(self, request: SynapseRequest) -> tuple[int, JsonDict]:
-        refresh_submission = parse_json_object_from_request(request)
-
-        assert_params_in_dict(refresh_submission, ["refresh_token"])
-        token = refresh_submission["refresh_token"]
-        if not isinstance(token, str):
-            raise SynapseError(400, "Invalid param: refresh_token", Codes.INVALID_PARAM)
-
-        now = self._clock.time_msec()
-        access_valid_until_ms = None
-        if self.refreshable_access_token_lifetime is not None:
-            access_valid_until_ms = now + self.refreshable_access_token_lifetime
-        refresh_valid_until_ms = None
-        if self.refresh_token_lifetime is not None:
-            refresh_valid_until_ms = now + self.refresh_token_lifetime
-
-        (
-            access_token,
-            refresh_token,
-            actual_access_token_expiry,
-        ) = await self._auth_handler.refresh_token(
-            token, access_valid_until_ms, refresh_valid_until_ms
-        )
-
-        response: dict[str, str | int] = {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-        }
-
-        # expires_in_ms is only present if the token expires
-        if actual_access_token_expiry is not None:
-            response["expires_in_ms"] = actual_access_token_expiry - now
-
-        return 200, response
-
-
-class SsoRedirectServlet(RestServlet):
-    PATTERNS = list(client_patterns("/login/(cas|sso)/redirect$", v1=True)) + [
-        re.compile(
-            "^"
-            + CLIENT_API_PREFIX
-            + "/(r0|v3)/login/sso/redirect/(?P<idp_id>[A-Za-z0-9_.~-]+)$"
-        )
-    ]
-    CATEGORY = "SSO requests needed for all SSO providers"
-
-    def __init__(self, hs: "HomeServer"):
-        # make sure that the relevant handlers are instantiated, so that they
-        # register themselves with the main SSOHandler.
-        _load_sso_handlers(hs)
-        self._sso_handler = hs.get_sso_handler()
-        self._public_baseurl = hs.config.server.public_baseurl
-
-    async def on_GET(self, request: SynapseRequest, idp_id: str | None = None) -> None:
-        if not self._public_baseurl:
-            raise SynapseError(400, "SSO requires a valid public_baseurl")
-
-        # if this isn't the expected hostname, redirect to the right one, so that we
-        # get our cookies back.
-        requested_uri = get_request_uri(request)
-        baseurl_bytes = self._public_baseurl.encode("utf-8")
-        if not requested_uri.startswith(baseurl_bytes):
-            # swap out the incorrect base URL for the right one.
-            #
-            # The idea here is to redirect from
-            #    https://foo.bar/whatever/_matrix/...
-            # to
-            #    https://public.baseurl/_matrix/...
-            #
-            i = requested_uri.index(b"/_matrix")
-            new_uri = baseurl_bytes[:-1] + requested_uri[i:]
-            logger.info(
-                "Requested URI %s is not canonical: redirecting to %s",
-                requested_uri.decode("utf-8", errors="replace"),
-                new_uri.decode("utf-8", errors="replace"),
-            )
-            request.redirect(new_uri)
-            finish_request(request)
-            return
-
-        args: dict[bytes, list[bytes]] = request.args  # type: ignore
-        client_redirect_url = parse_bytes_from_args(args, "redirectUrl", required=True)
-        try:
-            sso_url = await self._sso_handler.handle_redirect_request(
-                request,
-                client_redirect_url,
-                idp_id,
-            )
-        except SsoSetupError:
-            logger.exception(
-                "Login redirect failed because SSO/identity provider %r unavailable",
-                idp_id,
-            )
-            # Show an error page that is slightly more friendly than JSON
-            self._sso_handler.render_error(
-                request,
-                "provider_unavailable",
-                "This login provider is currently unavailable on this homeserver.",
-                code=503,
-            )
-            return
-
-        logger.info("Redirecting to %s", sso_url)
-        request.redirect(sso_url)
-        finish_request(request)
-
-
-class CasTicketServlet(RestServlet):
-    PATTERNS = client_patterns("/login/cas/ticket$", v1=True)
-
-    def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self._cas_handler = hs.get_cas_handler()
-
-    async def on_GET(self, request: SynapseRequest) -> None:
-        client_redirect_url = parse_string(request, "redirectUrl")
-        ticket = parse_string(request, "ticket", required=True)
-
-        # Maybe get a session ID (if this ticket is from user interactive
-        # authentication).
-        session = parse_string(request, "session")
-
-        # Either client_redirect_url or session must be provided.
-        if not client_redirect_url and not session:
-            message = "Missing string query parameter redirectUrl or session"
-            raise SynapseError(400, message, errcode=Codes.MISSING_PARAM)
-
-        await self._cas_handler.handle_ticket(
-            request, ticket, client_redirect_url, session
         )
 
 
@@ -750,19 +435,3 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
         SsoRedirectServlet(hs).register(http_server)
     if hs.config.cas.cas_enabled:
         CasTicketServlet(hs).register(http_server)
-
-
-def _load_sso_handlers(hs: "HomeServer") -> None:
-    """Ensure that the SSO handlers are loaded, if they are enabled by configuration.
-
-    This is mostly useful to ensure that the CAS/SAML/OIDC handlers register themselves
-    with the main SsoHandler.
-
-    It's safe to call this multiple times.
-    """
-    if hs.config.cas.cas_enabled:
-        hs.get_cas_handler()
-    if hs.config.saml2.saml2_enabled:
-        hs.get_saml_handler()
-    if hs.config.oidc.oidc_enabled:
-        hs.get_oidc_handler()
